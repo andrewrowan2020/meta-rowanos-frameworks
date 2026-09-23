@@ -1,4 +1,4 @@
-# meta-rowanos-framework
+# meta-rowanos-frameworks
 
 Open and source-releasable Yocto integration layer for the RowanOS platform.
 
