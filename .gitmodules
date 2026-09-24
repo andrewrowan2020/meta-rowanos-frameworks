@@ -1,0 +1,15 @@
+[submodule "recipes-game-runtime/fex-emu/source"]
+	path = recipes-game-runtime/fex-emu/source
+	url = https://github.com/FEX-Emu/FEX.git
+[submodule "recipes-game-runtime/proton/source"]
+	path = recipes-game-runtime/proton/source
+	url = https://github.com/ValveSoftware/Proton.git
+[submodule "recipes-game-runtime/ppsspp/source"]
+	path = recipes-game-runtime/ppsspp/source
+	url = https://github.com/hrydgard/ppsspp.git
+[submodule "recipes-game-runtime/waydroid/source"]
+	path = recipes-game-runtime/waydroid/source
+	url = https://github.com/waydroid/waydroid.git
+[submodule "recipes-game-runtime/retroarch/source"]
+	path = recipes-game-runtime/retroarch/source
+	url = https://github.com/libretro/RetroArch.git
