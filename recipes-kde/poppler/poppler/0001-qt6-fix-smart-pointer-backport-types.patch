@@ -1,0 +1,118 @@
+From 6e8d67f8cce73e33aa8a2f3d553ad95debc5e501 Mon Sep 17 00:00:00 2001
+From: RowanOS Build <rowanos@example.invalid>
+Date: Sun, 21 Sep 2026 15:30:00 +0800
+Subject: [PATCH] qt6: fix smart pointer types in Annot refcount backport
+
+The Qt 6 part of the CVE-2025-52886 backport accidentally adds pointer
+qualifiers to smart pointer values and to static_pointer_cast template
+arguments. The corresponding Qt 5 implementation uses value types.
+
+Restore the intended value types so the Qt 6 Poppler binding compiles.
+
+Upstream-Status: Inappropriate [fixes malformed downstream backport]
+Signed-off-by: RowanOS Build <rowanos@example.invalid>
+---
+diff --git a/qt6/src/poppler-annotation.cc b/qt6/src/poppler-annotation.cc
+--- a/qt6/src/poppler-annotation.cc
++++ b/qt6/src/poppler-annotation.cc
+@@ -1883,7 +1883,7 @@
+         return;
+     }
+ 
+-    std::unique_ptr<AnnotCalloutLine> *callout;
++    std::unique_ptr<AnnotCalloutLine> callout;
+     double x1, y1, x2, y2;
+     double MTX[6];
+     d->fillTransformationMTX(MTX);
+@@ -1966,7 +1966,7 @@
+ std::shared_ptr<Annot> LineAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     // Setters are defined in the public class
+-    std::unique_ptr<LineAnnotation> q = static_pointer_cast<LineAnnotation *>(makeAlias());
++    std::unique_ptr<LineAnnotation> q = static_pointer_cast<LineAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -2413,7 +2413,7 @@
+ std::shared_ptr<Annot> GeomAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     // Setters are defined in the public class
+-    std::unique_ptr<GeomAnnotation> q = static_pointer_cast<GeomAnnotation *>(makeAlias());
++    std::unique_ptr<GeomAnnotation> q = static_pointer_cast<GeomAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -2603,7 +2603,7 @@
+ std::shared_ptr<Annot> HighlightAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     // Setters are defined in the public class
+-    std::unique_ptr<HighlightAnnotation> q = static_pointer_cast<HighlightAnnotation *>(makeAlias());
++    std::unique_ptr<HighlightAnnotation> q = static_pointer_cast<HighlightAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -2718,7 +2718,7 @@
+ 
+ std::shared_ptr<Annot> StampAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+-    std::shared_ptr<StampAnnotation> q = static_pointer_cast<StampAnnotation *>(makeAlias());
++    std::unique_ptr<StampAnnotation> q = static_pointer_cast<StampAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -2738,7 +2738,7 @@
+     return pdfAnnot;
+ }
+ 
+-std::unique_ptr<AnnotStampImageHelper> *StampAnnotationPrivate::convertQImageToAnnotStampImageHelper(const QImage &qimg)
++std::unique_ptr<AnnotStampImageHelper> StampAnnotationPrivate::convertQImageToAnnotStampImageHelper(const QImage &qimg)
+ {
+     QImage convertedQImage = qimg;
+ 
+@@ -2902,7 +2902,7 @@
+ 
+ InkAnnotationPrivate::InkAnnotationPrivate() : AnnotationPrivate() { }
+ 
+-std::unique_ptr<Annotation> *InkAnnotationPrivate::makeAlias()
++std::unique_ptr<Annotation> InkAnnotationPrivate::makeAlias()
+ {
+     return std::unique_ptr<Annotation>(new InkAnnotation(*this));
+ }
+@@ -2921,7 +2921,7 @@
+ std::shared_ptr<Annot> InkAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     // Setters are defined in the public class
+-    std::unique_ptr<InkAnnotation> q = static_pointer_cast<InkAnnotation *>(makeAlias());
++    std::unique_ptr<InkAnnotation> q = static_pointer_cast<InkAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -3032,7 +3032,7 @@
+     return std::unique_ptr<Annotation>(new LinkAnnotation(*this));
+ }
+ 
+-std::unique_ptr<Annot> *LinkAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
++std::shared_ptr<Annot> LinkAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     return nullptr; // Not implemented
+ }
+@@ -3113,7 +3113,7 @@
+ std::shared_ptr<Annot> CaretAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     // Setters are defined in the public class
+-    std::unique_ptr<CaretAnnotation> q = static_pointer_cast<CaretAnnotation *>(makeAlias());
++    std::unique_ptr<CaretAnnotation> q = static_pointer_cast<CaretAnnotation>(makeAlias());
+ 
+     // Set page and document
+     pdfPage = destPage;
+@@ -3192,7 +3192,7 @@
+     return std::unique_ptr<Annotation>(new FileAttachmentAnnotation(*this));
+ }
+ 
+-std::shared_ptr<Annot> *FileAttachmentAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
++std::shared_ptr<Annot> FileAttachmentAnnotationPrivate::createNativeAnnot(::Page *destPage, DocumentData *doc)
+ {
+     return nullptr; // Not implemented
+ }
+-- 
+2.34.1
