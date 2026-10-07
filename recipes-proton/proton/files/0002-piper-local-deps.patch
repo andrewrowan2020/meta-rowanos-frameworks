@@ -1,0 +1,45 @@
+diff --git a/piper/CMakeLists.txt b/piper/CMakeLists.txt
+--- a/piper/CMakeLists.txt
++++ b/piper/CMakeLists.txt
+@@ -33,11 +33,12 @@
+ 
+   include(ExternalProject)
+   ExternalProject_Add(
+     fmt_external
+     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/f"
+-    URL "https://github.com/fmtlib/fmt/archive/refs/tags/${FMT_VERSION}.zip"
++    URL "file://$ENV{ROWANOS_PROTON_DEPS_DIR}/fmt-10.0.0.zip"
++    URL_HASH SHA256=5bf4d5358301fdf3bd100c01b9d4c1fbb2091dc2267fb4fa6d7cd522b3e47179
+     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${FMT_DIR}
+     CMAKE_ARGS -DFMT_TEST:BOOL=OFF  # Don't build all the tests
+   )
+   add_dependencies(piper fmt_external)
+   add_dependencies(test_piper fmt_external)
+@@ -49,11 +50,12 @@
+   set(SPDLOG_DIR "${CMAKE_CURRENT_BINARY_DIR}/si")
+   set(SPDLOG_VERSION "1.12.0")
+   ExternalProject_Add(
+     spdlog_external
+     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/s"
+-    URL "https://github.com/gabime/spdlog/archive/refs/tags/v${SPDLOG_VERSION}.zip"
++    URL "file://$ENV{ROWANOS_PROTON_DEPS_DIR}/spdlog-v1.12.0.zip"
++    URL_HASH SHA256=6174bf8885287422a6c6a0312eb8a30e8d22bcfcee7c48a6d02d1835d7769232
+     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${SPDLOG_DIR}
+   )
+   add_dependencies(piper spdlog_external)
+   add_dependencies(test_piper spdlog_external)
+ endif()
+@@ -63,11 +65,12 @@
+ if(NOT DEFINED PIPER_PHONEMIZE_DIR)
+   set(PIPER_PHONEMIZE_DIR "${CMAKE_CURRENT_BINARY_DIR}/pi")
+   ExternalProject_Add(
+     piper_phonemize_external
+     PREFIX "${CMAKE_CURRENT_BINARY_DIR}/p"
+-    URL "https://github.com/shaunren/piper-phonemize/archive/refs/heads/pic.zip"
++    URL "file://$ENV{ROWANOS_PROTON_DEPS_DIR}/piper-phonemize-5ecbb9b59abcffe03a9775ae82491c9ac5037f4d-rowanos.zip"
++    URL_HASH SHA256=c8296f3341920118cd14cf9494fd1111448112f76b10ef3df2b3daea34d5c665
+     CMAKE_ARGS -DCMAKE_INSTALL_PREFIX:PATH=${PIPER_PHONEMIZE_DIR}
+   )
+   add_dependencies(piper piper_phonemize_external)
+   add_dependencies(test_piper piper_phonemize_external)
+ endif()

@@ -1,0 +1,286 @@
+From: RowanOS integration <rowanos@example.invalid>
+Subject: [PATCH] vulkan: import real DMA heap memory for D16 linear scanout
+
+The verified D16 Mali ICD advertises IMPORTABLE but not EXPORTABLE for
+AR24/AB24 DMA-BUF images. Query the exact linear image usages and views
+before selecting an import-only route. Allocate a real system DMA heap
+buffer, intersect its memory types with the image requirements and import
+a duplicate FD with dedicated image memory. Keep the original FD for KMS.
+
+Use the driver's actual linear subresource offset and stride, reject
+out-of-bounds layouts, and retain the existing DRM framebuffer check.
+Restrict this route to verified D16 identity and packed 32-bit SDR formats;
+do not relax an export capability check or invent a modifier.
+
+Upstream-Status: Inappropriate [D16 vendor Mali ICD integration]
+---
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -6,6 +6,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <sys/ioctl.h>
++#include <linux/dma-heap.h>
++#include <climits>
+ #include <algorithm>
+ #include <array>
+ #include <bitset>
+@@ -472,6 +475,7 @@
+ 			return false;
+ 		}
+ 		m_bHasDrmPrimaryDevId = true;
++		m_bD16LinearImport = true;
+ 		m_drmPrimaryDevId = primaryStat.st_rdev;
+ 		vk_log.infof("D16 administrator single-GPU mapping: %s + %s", render, primary);
+ 	}
+@@ -1919,7 +1923,7 @@
+ }
+ 
+ 
+-static bool supportsLinearDmaBufExport( const VkImageCreateInfo &imageInfo )
++static bool supportsLinearDmaBuf( const VkImageCreateInfo &imageInfo, VkExternalMemoryFeatureFlags requiredFeature )
+ {
+     VkPhysicalDeviceExternalImageFormatInfo external = {};
+     external.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+@@ -1943,8 +1947,12 @@
+     props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+     props.pNext = &externalProps;
+     VkResult result = g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &query, &props);
++    vk_log.infof("linear DMA-BUF capability: Vk=%u usage=0x%x flags=0x%x required=0x%x result=%d externalFeatures=0x%x compatible=0x%x",
++                 unsigned(imageInfo.format), imageInfo.usage, imageInfo.flags, requiredFeature, int(result),
++                 externalProps.externalMemoryProperties.externalMemoryFeatures,
++                 externalProps.externalMemoryProperties.compatibleHandleTypes);
+     return result == VK_SUCCESS &&
+-        (externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT) &&
++        (externalProps.externalMemoryProperties.externalMemoryFeatures & requiredFeature) == requiredFeature &&
+         (externalProps.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
+         props.imageFormatProperties.maxExtent.width >= imageInfo.extent.width &&
+         props.imageFormatProperties.maxExtent.height >= imageInfo.extent.height &&
+@@ -1952,6 +1960,102 @@
+         props.imageFormatProperties.maxMipLevels >= imageInfo.mipLevels &&
+         props.imageFormatProperties.maxArrayLayers >= imageInfo.arrayLayers &&
+         (props.imageFormatProperties.sampleCounts & imageInfo.samples);
++}
++
++
++class D16ScopedFd
++{
++public:
++    explicit D16ScopedFd(int fd = -1) : m_fd(fd) {}
++    ~D16ScopedFd() { if (m_fd >= 0) close(m_fd); }
++    D16ScopedFd(const D16ScopedFd &) = delete;
++    D16ScopedFd &operator=(const D16ScopedFd &) = delete;
++    int get() const { return m_fd; }
++    int release() { return std::exchange(m_fd, -1); }
++    void reset(int fd) { if (m_fd >= 0) close(m_fd); m_fd = fd; }
++private:
++    int m_fd;
++};
++
++// This is deliberately confined to the verified D16/Mali/mediatek mapping.
++// The heap supplies real external memory; Vulkan imports a separate owned FD.
++static bool allocateD16ScanoutMemory(VkImage image, const VkMemoryRequirements &requirements,
++                                    VkMemoryPropertyFlags preferredProperties,
++                                    VkDeviceMemory *memory, int *backingFd)
++{
++    if (!requirements.size || !g_device.vk.GetMemoryFdPropertiesKHR) return false;
++    D16ScopedFd heap(open("/dev/dma_heap/system", O_RDWR | O_CLOEXEC));
++    if (heap.get() < 0) {
++        vk_log.errorf_errno("D16 scanout: open system DMA heap failed");
++        return false;
++    }
++    dma_heap_allocation_data allocation = {};
++    allocation.len = requirements.size;
++    allocation.fd_flags = O_RDWR | O_CLOEXEC;
++    if (ioctl(heap.get(), DMA_HEAP_IOCTL_ALLOC, &allocation) < 0) {
++        vk_log.errorf_errno("D16 scanout: DMA heap allocation failed");
++        return false;
++    }
++    D16ScopedFd backing(int(allocation.fd));
++    const off_t fdSize = lseek(backing.get(), 0, SEEK_END);
++    if (fdSize < 0 || uint64_t(fdSize) < requirements.size) {
++        vk_log.errorf("D16 scanout: DMA heap buffer smaller than image requirements");
++        return false;
++    }
++    VkMemoryFdPropertiesKHR fdProperties = {};
++    fdProperties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
++    VkResult result = g_device.vk.GetMemoryFdPropertiesKHR(g_device.device(),
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, backing.get(), &fdProperties);
++    if (result != VK_SUCCESS) {
++        vk_errorf(result, "D16 scanout: DMA heap memory properties failed");
++        return false;
++    }
++    const uint32_t compatible = requirements.memoryTypeBits & fdProperties.memoryTypeBits;
++    int32_t memoryType = g_device.findMemoryType(preferredProperties, compatible);
++    if (memoryType < 0) memoryType = g_device.findMemoryType(0, compatible);
++    if (memoryType < 0) {
++        vk_log.errorf("D16 scanout: no common DMA heap/image memory type");
++        return false;
++    }
++    D16ScopedFd imported(fcntl(backing.get(), F_DUPFD_CLOEXEC, 0));
++    if (imported.get() < 0) {
++        vk_log.errorf_errno("D16 scanout: duplicate DMA heap FD failed");
++        return false;
++    }
++    VkMemoryDedicatedAllocateInfo dedicated = {};
++    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++    dedicated.image = image;
++    VkImportMemoryFdInfoKHR import = {};
++    import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
++    import.pNext = &dedicated;
++    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++    import.fd = imported.get();
++    VkMemoryAllocateInfo info = {};
++    info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    info.pNext = &import;
++    info.allocationSize = uint64_t(fdSize);
++    info.memoryTypeIndex = uint32_t(memoryType);
++    result = g_device.vk.AllocateMemory(g_device.device(), &info, nullptr, memory);
++    if (result != VK_SUCCESS) {
++        vk_errorf(result, "D16 scanout: DMA heap Vulkan import failed");
++        return false;
++    }
++    imported.release(); // Only a successful Vulkan import consumes its FD.
++    *backingFd = backing.release();
++    return true;
++}
++
++// Only packed 32-bit SDR formats are enabled for this import route.
++static bool validD16LinearLayout(const VkSubresourceLayout &layout, uint32_t width,
++                                uint32_t height, VkDeviceSize allocationSize)
++{
++    const uint64_t rowBytes = uint64_t(width) * 4;
++    if (!width || !height || layout.offset > UINT32_MAX || layout.rowPitch > UINT32_MAX ||
++        layout.rowPitch < rowBytes || layout.offset > allocationSize ||
++        rowBytes > allocationSize - layout.offset ||
++        !layout.size || layout.size > allocationSize - layout.offset)
++        return false;
++    return uint64_t(height - 1) <= (allocationSize - layout.offset - rowBytes) / layout.rowPitch;
+ }
+ 
+ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
+@@ -2102,6 +2206,8 @@
+ 	}
+ 
+ 	bool bLinearDmaBufFallback = false;
++	bool bD16ImportScanout = false;
++	D16ScopedFd d16BackingFd;
+ 	std::vector<uint64_t> modifiers = {};
+ 	if ( flags.bFlippable == true && g_device.supportsModifiers() && !pDMA )
+ 	{
+@@ -2162,15 +2268,21 @@
+ 			const bool kmsLinear =
+ 				wlr_drm_format_set_has(&g_DRM.primary_formats, drmFormat, DRM_FORMAT_MOD_LINEAR) ||
+ 				wlr_drm_format_set_has(&g_DRM.primary_formats, drmFormat, DRM_FORMAT_MOD_INVALID);
+-			if (!kmsLinear || !supportsLinearDmaBufExport(imageInfo)) {
+-				vk_log.errorf("no exportable scanout layout: DRM=0x%" PRIX32 " Vk=%u usage=0x%x flags=0x%x candidates=%zu",
++			const bool exportable = kmsLinear && supportsLinearDmaBuf(imageInfo, VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
++            const bool importable = !exportable && kmsLinear && g_device.supportsD16LinearImport() &&
++                !pExistingImageToReuseMemory && !flags.bMappable && !BIsNested() && !g_bOutputHDREnabled &&
++                (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_ABGR8888) &&
++                supportsLinearDmaBuf(imageInfo, VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
++            if (!exportable && !importable) {
++				vk_log.errorf("no supported export/import scanout layout: DRM=0x%" PRIX32 " Vk=%u usage=0x%x flags=0x%x candidates=%zu",
+ 				              drmFormat, unsigned(imageInfo.format), imageInfo.usage, imageInfo.flags, numPossibleModifiers);
+ 				return false;
+ 			}
+ 			imageInfo.tiling = tiling = VK_IMAGE_TILING_LINEAR;
+ 			bLinearDmaBufFallback = true;
+-			vk_log.infof("validated linear DMA-BUF scanout: DRM=0x%" PRIX32 " Vk=%u usage=0x%x",
+-			             drmFormat, unsigned(imageInfo.format), imageInfo.usage);
++			bD16ImportScanout = importable;
++			vk_log.infof("validated linear DMA-BUF scanout: DRM=0x%" PRIX32 " Vk=%u usage=0x%x import=%u",
++			             drmFormat, unsigned(imageInfo.format), imageInfo.usage, unsigned(bD16ImportScanout));
+ 		} else {
+ 		modifierListInfo = {
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+@@ -2238,7 +2350,17 @@
+ 
+ 	VkDeviceMemory memoryHandle = VK_NULL_HANDLE;
+ 
+-	if ( pExistingImageToReuseMemory == nullptr )
++	if (bD16ImportScanout) {
++        int backingFd = -1;
++        if (!allocateD16ScanoutMemory(m_vkImage, memRequirements, properties, &memoryHandle, &backingFd)) {
++            g_device.vk.DestroyImage(g_device.device(), m_vkImage, nullptr);
++            m_vkImage = VK_NULL_HANDLE;
++            return false;
++        }
++        d16BackingFd.reset(backingFd);
++        m_vkImageMemory = memoryHandle;
++    }
++    else if ( pExistingImageToReuseMemory == nullptr )
+ 	{
+ 		// Possible pNexts
+ 		wsi_memory_allocate_info wsiAllocInfo = {};
+@@ -2373,11 +2495,15 @@
+ 			.memory = memoryHandle,
+ 			.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+ 		};
+-		res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &dmabuf.fd[0]);
+-		if ( res != VK_SUCCESS ) {
+-			vk_errorf( res, "vkGetMemoryFdKHR failed" );
+-			return false;
+-		}
++        if (bD16ImportScanout) {
++            dmabuf.fd[0] = d16BackingFd.get();
++        } else {
++            res = g_device.vk.GetMemoryFdKHR(g_device.device(), &memory_get_fd_info, &dmabuf.fd[0]);
++            if (res != VK_SUCCESS) {
++                vk_errorf(res, "vkGetMemoryFdKHR failed");
++                return false;
++            }
++        }
+ 
+ 		if ( tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+ 		{
+@@ -2436,6 +2562,14 @@
+ 			VkSubresourceLayout subresourceLayout = {};
+ 			g_device.vk.GetImageSubresourceLayout( g_device.device(), m_vkImage, &subresource, &subresourceLayout );
+ 
++            if (bD16ImportScanout && !validD16LinearLayout(subresourceLayout, width, height, m_size)) {
++                vk_log.errorf("D16 scanout: invalid linear layout offset=%" PRIu64 " stride=%" PRIu64 " size=%" PRIu64,
++                              subresourceLayout.offset, subresourceLayout.rowPitch, m_size);
++                return false;
++            }
++            if (bD16ImportScanout)
++                vk_log.infof("D16 DMA heap scanout layout: offset=%" PRIu64 " stride=%" PRIu64 " allocation=%" PRIu64,
++                             subresourceLayout.offset, subresourceLayout.rowPitch, m_size);
+ 			dmabuf.n_planes = 1;
+ 			dmabuf.modifier = bLinearDmaBufFallback &&
+ 				wlr_drm_format_set_has(&g_DRM.primary_formats, drmFormat, DRM_FORMAT_MOD_LINEAR)
+@@ -2445,6 +2579,7 @@
+ 		}
+ 
+ 		m_dmabuf = dmabuf;
++        if (bD16ImportScanout) d16BackingFd.release(); // Texture/KMS now retain the original heap FD.
+ 	}
+ 
+ 	if ( flags.bFlippable == true )
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -680,6 +680,7 @@
+ 	VK_FUNC(GetImageMemoryRequirements) \
+ 	VK_FUNC(GetImageSubresourceLayout) \
+ 	VK_FUNC(GetMemoryFdKHR) \
++	VK_FUNC(GetMemoryFdPropertiesKHR) \
+ 	VK_FUNC(GetSemaphoreCounterValue) \
+ 	VK_FUNC(GetSwapchainImagesKHR) \
+ 	VK_FUNC(MapMemory) \
+@@ -735,6 +736,7 @@
+ 	inline VkBuffer uploadBuffer() {return m_uploadBuffer;}
+ 	inline VkPipelineLayout pipelineLayout() {return m_pipelineLayout;}
+ 	inline int drmRenderFd() {return m_drmRendererFd;}
++	inline bool supportsD16LinearImport() { return m_bD16LinearImport; }
+ 	inline bool supportsModifiers() {return m_bSupportsModifiers;}
+ 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
+ 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
+@@ -799,6 +801,7 @@
+ 	dev_t m_drmPrimaryDevId = 0;
+ 
+ 	bool m_bSingleGpu = false;
++	bool m_bD16LinearImport = false;
+ 	bool m_bSupportsPresentWait = false;
+ 	bool m_bSupportsNullDescriptors = false;
+ 	bool createDummyResources();

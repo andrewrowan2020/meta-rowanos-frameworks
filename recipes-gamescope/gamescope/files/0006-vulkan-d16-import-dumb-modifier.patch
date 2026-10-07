@@ -1,0 +1,268 @@
+From: RowanOS integration <rowanos@example.invalid>
+Subject: [PATCH] vulkan: import D16 dumb BO with its explicit linear modifier
+
+Mali supports DMA-BUF import with DRM modifier 0 but rejects ordinary
+VK_IMAGE_TILING_LINEAR for the scanout usage and mutable format contract.
+Keep the exact modifier query. Get real pitch and size from CREATE_DUMB,
+export its PRIME FD, and create the image with the explicit plane layout.
+Import a duplicate FD using compatible memory types and dedicated memory.
+
+Verify the returned Vulkan modifier/layout against the dumb BO metadata
+and preserve AddFB validation. PRIME owns the backing object independently
+of the creator GEM handle; all FD and handle failure paths are bounded.
+
+Upstream-Status: Inappropriate [D16 vendor Mali ICD integration]
+---
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -2058,6 +2058,153 @@
+     return uint64_t(height - 1) <= (allocationSize - layout.offset - rowBytes) / layout.rowPitch;
+ }
+ 
++
++class D16ScopedDumb
++{
++public:
++    D16ScopedDumb(int fd, uint32_t handle) : m_fd(fd), m_handle(handle) {}
++    ~D16ScopedDumb() {
++        drm_mode_destroy_dumb destroy = {};
++        destroy.handle = m_handle;
++        if (m_handle) drmIoctl(m_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy);
++    }
++    D16ScopedDumb(const D16ScopedDumb &) = delete;
++    D16ScopedDumb &operator=(const D16ScopedDumb &) = delete;
++private:
++    int m_fd;
++    uint32_t m_handle;
++};
++
++static bool createD16DumbBuffer(int drmFd, uint32_t width, uint32_t height,
++                                VkSubresourceLayout *layout, VkDeviceSize *size, int *backingFd)
++{
++    if (drmFd < 0 || !width || !height) return false;
++    drm_mode_create_dumb create = {};
++    create.width = width;
++    create.height = height;
++    create.bpp = 32;
++    if (drmIoctl(drmFd, DRM_IOCTL_MODE_CREATE_DUMB, &create) < 0) {
++        vk_log.errorf_errno("D16 scanout: CREATE_DUMB failed");
++        return false;
++    }
++    D16ScopedDumb dumb(drmFd, create.handle);
++    VkSubresourceLayout actual = {};
++    // A dumb BO is a single packed linear plane starting at byte zero.
++    actual.offset = 0;
++    actual.rowPitch = create.pitch;
++    actual.size = create.size;
++    if (!create.handle || !validD16LinearLayout(actual, width, height, create.size)) {
++        vk_log.errorf("D16 scanout: invalid dumb BO pitch/size");
++        return false;
++    }
++    int primeFd = -1;
++    if (drmPrimeHandleToFD(drmFd, create.handle, DRM_CLOEXEC | DRM_RDWR, &primeFd) < 0) {
++        vk_log.errorf_errno("D16 scanout: dumb BO PRIME export failed");
++        return false;
++    }
++    *layout = actual;
++    *size = create.size;
++    *backingFd = primeFd;
++    // PRIME retains the GEM object after the creator handle is closed.
++    return true;
++}
++
++static bool importD16DumbMemory(VkImage image, const VkMemoryRequirements &requirements,
++                               VkMemoryPropertyFlags preferredProperties, int backingFd,
++                               VkDeviceSize backingSize, VkDeviceMemory *memory)
++{
++    if (!requirements.size || backingFd < 0 || !g_device.vk.GetMemoryFdPropertiesKHR) return false;
++    const off_t fdSize = lseek(backingFd, 0, SEEK_END);
++    if (fdSize < 0 || uint64_t(fdSize) < backingSize || uint64_t(fdSize) < requirements.size) {
++        vk_log.errorf("D16 scanout: dumb PRIME buffer smaller than image requirements");
++        return false;
++    }
++    VkMemoryFdPropertiesKHR fdProperties = {};
++    fdProperties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
++    VkResult result = g_device.vk.GetMemoryFdPropertiesKHR(g_device.device(),
++        VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, backingFd, &fdProperties);
++    if (result != VK_SUCCESS) {
++        vk_errorf(result, "D16 scanout: dumb PRIME memory properties failed");
++        return false;
++    }
++    const uint32_t compatible = requirements.memoryTypeBits & fdProperties.memoryTypeBits;
++    int32_t memoryType = g_device.findMemoryType(preferredProperties, compatible);
++    if (memoryType < 0) memoryType = g_device.findMemoryType(0, compatible);
++    if (memoryType < 0) {
++        vk_log.errorf("D16 scanout: no common dumb PRIME/image memory type");
++        return false;
++    }
++    D16ScopedFd imported(fcntl(backingFd, F_DUPFD_CLOEXEC, 0));
++    if (imported.get() < 0) {
++        vk_log.errorf_errno("D16 scanout: duplicate dumb PRIME FD failed");
++        return false;
++    }
++    VkMemoryDedicatedAllocateInfo dedicated = {};
++    dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++    dedicated.image = image;
++    VkImportMemoryFdInfoKHR import = {};
++    import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
++    import.pNext = &dedicated;
++    import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++    import.fd = imported.get();
++    VkMemoryAllocateInfo info = {};
++    info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++    info.pNext = &import;
++    info.allocationSize = uint64_t(fdSize);
++    info.memoryTypeIndex = uint32_t(memoryType);
++    result = g_device.vk.AllocateMemory(g_device.device(), &info, nullptr, memory);
++    if (result != VK_SUCCESS) {
++        vk_errorf(result, "D16 scanout: dumb PRIME Vulkan import failed");
++        return false;
++    }
++    imported.release(); // Successful import consumes only the duplicate.
++    return true;
++}
++
++static bool supportsD16DumbImport(const VkImageCreateInfo &imageInfo)
++{
++    VkPhysicalDeviceImageDrmFormatModifierInfoEXT modifier = {};
++    modifier.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT;
++    modifier.drmFormatModifier = DRM_FORMAT_MOD_LINEAR;
++    modifier.sharingMode = imageInfo.sharingMode;
++    VkPhysicalDeviceExternalImageFormatInfo external = {};
++    external.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
++    external.pNext = &modifier;
++    external.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++    VkPhysicalDeviceImageFormatInfo2 query = {};
++    query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
++    query.pNext = &external;
++    query.format = imageInfo.format;
++    query.type = imageInfo.imageType;
++    query.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++    query.usage = imageInfo.usage;
++    query.flags = imageInfo.flags;
++    VkImageFormatListCreateInfo views = {};
++    if (const auto *list = pNextFind<VkImageFormatListCreateInfo>(&imageInfo, VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO)) {
++        views = *list;
++        views.pNext = std::exchange(query.pNext, &views);
++    }
++    VkExternalImageFormatProperties externalProps = {};
++    externalProps.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES;
++    VkImageFormatProperties2 props = {};
++    props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
++    props.pNext = &externalProps;
++    VkResult result = g_device.vk.GetPhysicalDeviceImageFormatProperties2(g_device.physDev(), &query, &props);
++    vk_log.infof("D16 dumb modifier capability: Vk=%u usage=0x%x flags=0x%x result=%d externalFeatures=0x%x compatible=0x%x",
++                 unsigned(imageInfo.format), imageInfo.usage, imageInfo.flags, int(result),
++                 externalProps.externalMemoryProperties.externalMemoryFeatures,
++                 externalProps.externalMemoryProperties.compatibleHandleTypes);
++    return result == VK_SUCCESS &&
++        (externalProps.externalMemoryProperties.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) &&
++        (externalProps.externalMemoryProperties.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT) &&
++        props.imageFormatProperties.maxExtent.width >= imageInfo.extent.width &&
++        props.imageFormatProperties.maxExtent.height >= imageInfo.extent.height &&
++        props.imageFormatProperties.maxExtent.depth >= imageInfo.extent.depth &&
++        props.imageFormatProperties.maxMipLevels >= imageInfo.mipLevels &&
++        props.imageFormatProperties.maxArrayLayers >= imageInfo.arrayLayers &&
++        (props.imageFormatProperties.sampleCounts & imageInfo.samples);
++}
++
+ static VkImageViewType VulkanImageTypeToViewType(VkImageType type)
+ {
+ 	switch (type)
+@@ -2207,6 +2354,9 @@
+ 
+ 	bool bLinearDmaBufFallback = false;
+ 	bool bD16ImportScanout = false;
++    bool bD16DumbScanout = false;
++    VkSubresourceLayout d16DumbLayout = {};
++    VkDeviceSize d16DumbSize = 0;
+ 	D16ScopedFd d16BackingFd;
+ 	std::vector<uint64_t> modifiers = {};
+ 	if ( flags.bFlippable == true && g_device.supportsModifiers() && !pDMA )
+@@ -2262,6 +2412,33 @@
+ 		}
+ 
+ 		if (modifiers.empty()) {
++            const bool dumbCandidate = g_device.supportsD16LinearImport() &&
++                !pExistingImageToReuseMemory && !flags.bMappable && !BIsNested() && !g_bOutputHDREnabled &&
++                (drmFormat == DRM_FORMAT_ARGB8888 || drmFormat == DRM_FORMAT_ABGR8888) &&
++                wlr_drm_format_set_has(&g_DRM.primary_formats, drmFormat, DRM_FORMAT_MOD_LINEAR) &&
++                DRMModifierProps.count(imageInfo.format) &&
++                DRMModifierProps[imageInfo.format].count(DRM_FORMAT_MOD_LINEAR) &&
++                DRMModifierProps[imageInfo.format][DRM_FORMAT_MOD_LINEAR].drmFormatModifierPlaneCount == 1;
++            if (dumbCandidate && supportsD16DumbImport(imageInfo)) {
++                int backingFd = -1;
++                if (!createD16DumbBuffer(g_DRM.fd, width, height, &d16DumbLayout, &d16DumbSize, &backingFd))
++                    return false;
++                d16BackingFd.reset(backingFd);
++                modifierPlaneLayouts[0].offset = d16DumbLayout.offset;
++                modifierPlaneLayouts[0].rowPitch = d16DumbLayout.rowPitch;
++                // Explicit modifier create requires size/arrayPitch/depthPitch zero.
++                modifierInfo = {
++                    .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
++                    .pNext = std::exchange(imageInfo.pNext, &modifierInfo),
++                    .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
++                    .drmFormatModifierPlaneCount = 1,
++                    .pPlaneLayouts = modifierPlaneLayouts,
++                };
++                imageInfo.tiling = tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
++                bD16ImportScanout = bD16DumbScanout = true;
++                vk_log.infof("D16 dumb BO scanout: offset=%" PRIu64 " stride=%" PRIu64 " size=%" PRIu64,
++                             d16DumbLayout.offset, d16DumbLayout.rowPitch, d16DumbSize);
++            } else {
+ 			// Legacy KMS can accept a proven linear layout without a modifier blob.
+ 			// Query the complete usages, view formats and external export contract;
+ 			// never reinterpret an optimal-tiled allocation as a linear buffer.
+@@ -2283,6 +2460,7 @@
+ 			bD16ImportScanout = importable;
+ 			vk_log.infof("validated linear DMA-BUF scanout: DRM=0x%" PRIX32 " Vk=%u usage=0x%x import=%u",
+ 			             drmFormat, unsigned(imageInfo.format), imageInfo.usage, unsigned(bD16ImportScanout));
++            }
+ 		} else {
+ 		modifierListInfo = {
+ 			.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO_EXT,
+@@ -2350,7 +2528,16 @@
+ 
+ 	VkDeviceMemory memoryHandle = VK_NULL_HANDLE;
+ 
+-	if (bD16ImportScanout) {
++    if (bD16DumbScanout) {
++        if (!importD16DumbMemory(m_vkImage, memRequirements, properties, d16BackingFd.get(), d16DumbSize, &memoryHandle)) {
++            g_device.vk.DestroyImage(g_device.device(), m_vkImage, nullptr);
++            m_vkImage = VK_NULL_HANDLE;
++            return false;
++        }
++        m_size = d16DumbSize;
++        m_vkImageMemory = memoryHandle;
++    }
++    else if (bD16ImportScanout) {
+         int backingFd = -1;
+         if (!allocateD16ScanoutMemory(m_vkImage, memRequirements, properties, &memoryHandle, &backingFd)) {
+             g_device.vk.DestroyImage(g_device.device(), m_vkImage, nullptr);
+@@ -2505,7 +2692,25 @@
+             }
+         }
+ 
+-		if ( tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
++        if (bD16DumbScanout) {
++            VkImageDrmFormatModifierPropertiesEXT actualModifier = {};
++            actualModifier.sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_PROPERTIES_EXT;
++            res = g_device.vk.GetImageDrmFormatModifierPropertiesEXT(g_device.device(), m_vkImage, &actualModifier);
++            const VkImageSubresource subresource = { .aspectMask = VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT };
++            VkSubresourceLayout actual = {};
++            g_device.vk.GetImageSubresourceLayout(g_device.device(), m_vkImage, &subresource, &actual);
++            if (res != VK_SUCCESS || actualModifier.drmFormatModifier != DRM_FORMAT_MOD_LINEAR ||
++                actual.offset != d16DumbLayout.offset || actual.rowPitch != d16DumbLayout.rowPitch ||
++                !validD16LinearLayout(actual, width, height, d16DumbSize)) {
++                vk_log.errorf("D16 scanout: Vulkan modifier/layout differs from dumb BO");
++                return false;
++            }
++            dmabuf.n_planes = 1;
++            dmabuf.modifier = DRM_FORMAT_MOD_LINEAR;
++            dmabuf.offset[0] = d16DumbLayout.offset;
++            dmabuf.stride[0] = d16DumbLayout.rowPitch;
++        }
++        else if ( tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT )
+ 		{
+ 			assert( g_device.vk.GetImageDrmFormatModifierPropertiesEXT != nullptr );
+ 

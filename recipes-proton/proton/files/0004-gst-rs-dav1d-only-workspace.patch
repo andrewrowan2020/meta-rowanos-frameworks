@@ -1,0 +1,13 @@
+diff --git a/gst-plugins-rs/Cargo.toml b/gst-plugins-rs/Cargo.toml
+--- a/gst-plugins-rs/Cargo.toml
++++ b/gst-plugins-rs/Cargo.toml
+@@ -1,5 +1,9 @@
+ [workspace]
++members = ["version-helper", "video/dav1d"]
++default-members = ["video/dav1d"]
++
++[workspace.metadata.upstream]
+ 
+ members = [
+     "tutorial",
+     "version-helper",

@@ -1,0 +1,65 @@
+diff --git a/proton b/proton
+index 977dc4e..1c5ca03 100755
+--- a/proton
++++ b/proton
+@@ -993,7 +993,7 @@ class CompatData:
+                 os.symlink("/", self.prefix_dir + "/dosdevices/z:")
+ 
+             # collect configuration info
+-            steamdir = os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]
++            steamdir = os.environ.get("STEAM_COMPAT_CLIENT_INSTALL_PATH", "")
+ 
+             use_wined3d = "wined3d" in g_session.compat_config
+             use_dxvk_dxgi = not use_wined3d and \
+@@ -1095,7 +1095,7 @@ class CompatData:
+                                ("Steam.dll", "Steam.dll")]
+                 for (src,tgt) in filestocopy:
+                     srcfile = steamdir + '/legacycompat/' + src
+-                    if os.path.isfile(srcfile):
++                    if os.environ.get("ROWANOS_STANDALONE") != "1" and os.path.isfile(srcfile):
+                         try_copy(srcfile, steam_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+ 
+                 filestocopy = [("steamclient64.dll", "steamclient64.dll"),
+@@ -1103,7 +1103,7 @@ class CompatData:
+                                ("GameOverlayRenderer64.dll", "GameOverlayRenderer64.dll")]
+                 for (src,tgt) in filestocopy:
+                     srcfile = g_proton.path(src)
+-                    if os.path.isfile(srcfile):
++                    if os.environ.get("ROWANOS_STANDALONE") != "1" and os.path.isfile(srcfile):
+                         try_copy(srcfile, steam_dir + tgt, prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+ 
+                 # CW Bug 19152. IL-2 Sturmovik: Cliffs of Dover Blitz Edition needs user's localconfig.vdf
+@@ -1170,7 +1170,10 @@ class CompatData:
+                 for f in dxvkfiles:
+                     try_copy(g_proton.arch_pe_dir("wine/dxvk", False) + f + ".dll", "drive_c/windows/system32",
+                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+-                    try_copy(g_proton.arch_pe_dir("wine/dxvk", True) + f + ".dll", "drive_c/windows/syswow64",
++                    dxvk32 = g_proton.arch_pe_dir("wine/dxvk", True) + f + ".dll"
++                    if f == "d3d9" and os.environ.get("ROWANOS_DXVK_D3D9_DIR"):
++                        dxvk32 = os.path.join(os.environ["ROWANOS_DXVK_D3D9_DIR"], "x32", "d3d9.dll")
++                    try_copy(dxvk32, "drive_c/windows/syswow64",
+                             prefix=self.prefix_dir, track_file=tracked_files, link_debug=True)
+                     g_session.dlloverrides[f] = "n"
+ 
+@@ -1236,7 +1239,8 @@ class CompatData:
+             setup_openvr_paths()
+ 
+             # add Steam ffmpeg libraries to path
+-            prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
++            if steamdir:
++                prepend_to_env_str(g_session.env, ld_path_var, steamdir + "/ubuntu12_64/video/:" + steamdir + "/ubuntu12_32/video/:" + steamdir + "/steamrtarm64/video/", ":")
+ 
+ def comma_escaped(s):
+     escaped = False
+@@ -2053,6 +2057,11 @@ class Session:
+         return subprocess.call(args, env=local_env, stderr=self.log_file, stdout=self.log_file)
+ 
+     def run(self):
++        if os.environ.get("ROWANOS_STANDALONE") == "1":
++            # Launch the registered game directly; no Steam client or
++            # Steam Linux Runtime launcher is involved in this path.
++            return self.run_proc([g_proton.wine_bin] + sys.argv[2:] + self.cmdlineappend)
++
+         if shutil.which('steam-runtime-launcher-interface-0') is not None:
+             adverb = ['steam-runtime-launcher-interface-0', 'proton']
+         else:

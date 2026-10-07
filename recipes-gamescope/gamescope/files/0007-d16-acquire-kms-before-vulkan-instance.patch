@@ -1,0 +1,145 @@
+From: RowanOS runtime integration
+Subject: [PATCH] D16: acquire mapped KMS through the seat before Mali instance
+
+Mali r48 opens card0 from vkCreateInstance and can become DRM master before
+libseat takes the device. For an explicit D16 opt-in, acquire the verified
+mediatek primary through the seat first. Retain normal nested initialization
+and verify Vulkan later resolves to that same primary. No vendor features
+are synthesized.
+
+Upstream-Status: Inappropriate [D16 vendor ICD integration]
+
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -746,7 +746,20 @@
+ 		}
+ 	}
+ 
++	// The D16 vendor ICD opens the primary node while creating its instance.
++	// Acquire that KMS device through the seat manager first, so the ICD's
++	// independent file cannot become DRM master ahead of logind.
++	const char *kmsFirst = getenv("ROWANOS_D16_KMS_FIRST");
++	const bool d16KmsFirst = !BIsNested() && kmsFirst && !strcmp(kmsFirst, "1");
++	if ( d16KmsFirst && !initOutput( g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
++	{
++		fprintf( stderr, "Failed to initialize D16 output before Vulkan instance\n" );
++		return 1;
++	}
++
+ 	VkInstance instance = vulkan_create_instance();
++	if ( instance == VK_NULL_HANDLE )
++		return 1;
+ 	VkSurfaceKHR surface = VK_NULL_HANDLE;
+ 
+ 	if ( !BIsNested() )
+@@ -765,7 +778,7 @@
+ 	}
+ #endif
+ 
+-	if ( !initOutput( g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
++	if ( !d16KmsFirst && !initOutput( g_nPreferredOutputWidth, g_nPreferredOutputHeight, g_nNestedRefresh ) )
+ 	{
+ 		fprintf( stderr, "Failed to initialize output\n" );
+ 		return 1;
+@@ -786,6 +799,20 @@
+ 	{
+ 		fprintf( stderr, "Failed to initialize Vulkan\n" );
+ 		return 1;
++	}
++
++	// Fail closed if Vulkan later identifies a primary different from the
++	// administrator's explicit early KMS selection.
++	if ( d16KmsFirst )
++	{
++		dev_t primaryId = 0;
++		struct stat outputStat = {};
++		if ( !vulkan_primary_dev_id( &primaryId ) || fstat( g_DRM.fd, &outputStat ) ||
++		     !S_ISCHR( outputStat.st_mode ) || outputStat.st_rdev != primaryId )
++		{
++			fprintf( stderr, "D16 Vulkan and early KMS primary device identities differ\n" );
++			return 1;
++		}
+ 	}
+ 
+ 	if ( !vulkan_init_formats() )
+--- a/src/drm.cpp
++++ b/src/drm.cpp
+@@ -1359,6 +1359,50 @@
+ 	return !!atoi(env);
+ }
+ 
++// This path runs before the vendor Vulkan ICD has opened a primary node.
++// It must use the same administrator-verified fixed D16 mapping as Vulkan,
++// never an arbitrary enumerated GPU.
++static bool selectD16EarlyPrimaryNode(struct drm_t *drm)
++{
++	const char *optIn = getenv("ROWANOS_D16_SINGLE_GPU");
++	const char *render = getenv("ROWANOS_DRM_RENDER_NODE");
++	const char *primary = getenv("ROWANOS_DRM_PRIMARY_NODE");
++	struct stat renderStat = {}, primaryStat = {};
++	if (!optIn || strcmp(optIn, "1") || !render || !primary ||
++	    strcmp(render, "/dev/dri/renderD128") || strcmp(primary, "/dev/dri/card0") ||
++	    stat(render, &renderStat) || stat(primary, &primaryStat) ||
++	    !S_ISCHR(renderStat.st_mode) || !S_ISCHR(primaryStat.st_mode)) {
++		drm_log.errorf("D16 early KMS requires the explicit fixed render/primary mapping");
++		return false;
++	}
++	drmDevice *renderDev = nullptr, *primaryDev = nullptr;
++	bool nodesMatch = drmGetDeviceFromDevId(renderStat.st_rdev, 0, &renderDev) == 0 &&
++	                  drmGetDeviceFromDevId(primaryStat.st_rdev, 0, &primaryDev) == 0 &&
++	                  (renderDev->available_nodes & (1 << DRM_NODE_RENDER)) &&
++	                  (primaryDev->available_nodes & (1 << DRM_NODE_PRIMARY)) &&
++	                  drmDevicesEqual(renderDev, primaryDev);
++	if (renderDev) drmFreeDevice(&renderDev);
++	if (primaryDev) drmFreeDevice(&primaryDev);
++	if (!nodesMatch) {
++		drm_log.errorf("D16 early KMS render/primary nodes are different devices");
++		return false;
++	}
++	drm->device_name = strdup(primary);
++	return drm->device_name != nullptr;
++}
++
++static bool validateD16EarlyKmsFd(int fd)
++{
++	struct stat selected = {}, primary = {};
++	if (fstat(fd, &selected) || stat("/dev/dri/card0", &primary) ||
++	    !S_ISCHR(selected.st_mode) || !S_ISCHR(primary.st_mode) || selected.st_rdev != primary.st_rdev)
++		return false;
++	drmVersion *version = drmGetVersion(fd);
++	bool isD16 = version && version->name && strcmp(version->name, "mediatek") == 0;
++	if (version) drmFreeVersion(version);
++	return isD16;
++}
++
+ bool init_drm(struct drm_t *drm, int width, int height, int refresh, bool wants_adaptive_sync)
+ {
+ 	load_pnps();
+@@ -1370,7 +1414,14 @@
+ 
+ 	drm->device_name = nullptr;
+ 	dev_t dev_id = 0;
+-	if (vulkan_primary_dev_id(&dev_id)) {
++	const char *kmsFirst = getenv("ROWANOS_D16_KMS_FIRST");
++	const bool d16KmsFirst = kmsFirst && !strcmp(kmsFirst, "1");
++	if (d16KmsFirst) {
++		if (!selectD16EarlyPrimaryNode(drm))
++			return false;
++		drm_log.infof("opening explicit D16 KMS node '%s' before Vulkan instance", drm->device_name);
++	}
++	else if (vulkan_primary_dev_id(&dev_id)) {
+ 		drmDevice *drm_dev = nullptr;
+ 		if (drmGetDeviceFromDevId(dev_id, 0, &drm_dev) != 0) {
+ 			drm_log.errorf("Failed to find DRM device with device ID %" PRIu64, (uint64_t)dev_id);
+@@ -1389,6 +1440,11 @@
+ 	if ( drm->fd < 0 )
+ 	{
+ 		drm_log.errorf("Could not open KMS device");
++		return false;
++	}
++
++	if (d16KmsFirst && !validateD16EarlyKmsFd(drm->fd)) {
++		drm_log.errorf("D16 early KMS descriptor is not the mapped mediatek primary");
+ 		return false;
+ 	}
+ 

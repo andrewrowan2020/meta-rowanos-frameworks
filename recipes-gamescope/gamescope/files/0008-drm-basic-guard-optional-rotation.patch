@@ -1,0 +1,33 @@
+From: RowanOS <rowanos@localhost>
+Subject: [PATCH] drm: honor optional primary-plane rotation in basic commits
+
+A plane may legally omit rotation when it only presents unrotated buffers.
+Do not attempt that optional write on every frame. Reject requests for a
+non-identity transform when the property is absent, and propagate errors
+when the property exists. This preserves capability checks and eliminates
+D16's missing-property log on every successful basic-plane commit.
+
+Upstream-Status: Inappropriate [D16 basic-plane integration]
+
+--- a/src/drm.cpp
++++ b/src/drm.cpp
+@@ -2123,7 +2123,18 @@
+ 
+ 	drm->fbids_in_req.push_back( fb_id );
+ 
+-	add_plane_property(req, drm->primary, "rotation", g_drmEffectiveOrientation[screenType] );
++	const uint64_t orientation = g_drmEffectiveOrientation[screenType].load();
++	if ( drm->primary->props.count("rotation") > 0 )
++	{
++		int ret = add_plane_property(req, drm->primary, "rotation", orientation);
++		if ( ret < 0 )
++			return ret;
++	}
++	else if ( orientation != DRM_MODE_ROTATE_0 )
++	{
++		drm_log.errorf("primary plane %u cannot apply requested rotation", drm->primary->id);
++		return -EINVAL;
++	}
+ 
+ 	add_plane_property(req, drm->primary, "FB_ID", fb_id);
+ 	add_plane_property(req, drm->primary, "CRTC_ID", drm->crtc->id);

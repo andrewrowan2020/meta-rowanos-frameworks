@@ -1,0 +1,294 @@
+From: RowanOS <rowanos@example.invalid>
+Subject: [PATCH] Vulkan: validate Vulkan capability and provide optional feature fallbacks
+Upstream-Status: Inappropriate [D16 capability adaptation]
+
+--- a/src/rendervulkan.cpp
++++ b/src/rendervulkan.cpp
+@@ -259,6 +259,9 @@
+ 	if (!createScratchResources())
+ 		return false;
+ 
++	if (!m_bSupportsNullDescriptors && !createDummyResources())
++		return false;
++
+ 	m_bInitialized = true;
+ 
+ 	std::thread piplelineThread([this](){compileAllPipelines();});
+@@ -453,6 +456,38 @@
+ 		m_bSupportsFp16 = vulkan12Features.shaderFloat16 && features2.features.shaderInt16;
+ 	}
+ 
++	auto hasExtension = [&supportedExts](const char *name) {
++		return std::any_of(supportedExts.begin(), supportedExts.end(), [name](const auto &ext) {
++			return strcmp(name, ext.extensionName) == 0;
++		});
++	};
++	for (const char *name : {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME, VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME}) {
++		if (!hasExtension(name)) { vk_log.errorf("mandatory extension missing: %s", name); return false; }
++	}
++	VkPhysicalDeviceVulkan13Features supported13 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES };
++	VkPhysicalDeviceVulkan12Features supported12 = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, .pNext = &supported13 };
++	VkPhysicalDeviceSamplerYcbcrConversionFeatures supportedYcbcr = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES, .pNext = &supported12 };
++	VkPhysicalDeviceFeatures2 supportedFeatures = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &supportedYcbcr };
++	vk.GetPhysicalDeviceFeatures2(physDev(), &supportedFeatures);
++	if (!supported13.dynamicRendering || !supported12.uniformAndStorageBuffer8BitAccess ||
++	    !supported12.scalarBlockLayout || !supported12.timelineSemaphore || !supportedYcbcr.samplerYcbcrConversion) {
++		vk_log.errorf("mandatory Vulkan features missing (dynamic rendering, 8-bit buffer access, scalar layout, timeline semaphore, YCbCr)");
++		return false;
++	}
++	if (hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
++		VkPhysicalDeviceRobustness2FeaturesEXT robust = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT };
++		VkPhysicalDeviceFeatures2 query = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &robust };
++		vk.GetPhysicalDeviceFeatures2(physDev(), &query);
++		m_bSupportsNullDescriptors = robust.nullDescriptor;
++	}
++	if (BIsNested() && hasExtension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME) && hasExtension(VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
++		VkPhysicalDevicePresentWaitFeaturesKHR wait = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR };
++		VkPhysicalDevicePresentIdFeaturesKHR id = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR, .pNext = &wait };
++		VkPhysicalDeviceFeatures2 query = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &id };
++		vk.GetPhysicalDeviceFeatures2(physDev(), &query);
++		m_bSupportsPresentWait = wait.presentWait && id.presentId;
++	}
++	bool useGlobalPriority = g_bNiceCap && hasExtension(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME);
+ 	float queuePriorities = 1.0f;
+ 
+ 	VkDeviceQueueGlobalPriorityCreateInfoEXT queueCreateInfoEXT = {
+@@ -465,14 +500,14 @@
+ 	{
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-			.pNext = g_bNiceCap ? &queueCreateInfoEXT : nullptr,
++			.pNext = useGlobalPriority ? &queueCreateInfoEXT : nullptr,
+ 			.queueFamilyIndex = m_queueFamily,
+ 			.queueCount = 1,
+ 			.pQueuePriorities = &queuePriorities
+ 		},
+ 		{
+ 			.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+-			.pNext = g_bNiceCap ? &queueCreateInfoEXT : nullptr,
++			.pNext = useGlobalPriority ? &queueCreateInfoEXT : nullptr,
+ 			.queueFamilyIndex = m_generalQueueFamily,
+ 			.queueCount = 1,
+ 			.pQueuePriorities = &queuePriorities
+@@ -480,14 +515,20 @@
+ 	};
+ 
+ 	std::vector< const char * > enabledExtensions;
++	if (useGlobalPriority) enabledExtensions.push_back(VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME);
+ 
+ 	if ( BIsNested() == true )
+ 	{
+ 		enabledExtensions.push_back( VK_KHR_SWAPCHAIN_EXTENSION_NAME );
+ 		enabledExtensions.push_back( VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME );
+ 
+-		enabledExtensions.push_back( VK_KHR_PRESENT_ID_EXTENSION_NAME );
+-		enabledExtensions.push_back( VK_KHR_PRESENT_WAIT_EXTENSION_NAME );
++		if (!hasExtension(VK_KHR_SWAPCHAIN_EXTENSION_NAME) || !hasExtension(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME)) {
++			vk_log.errorf("nested mode requires swapchain and mutable swapchain format"); return false;
++		}
++		if (m_bSupportsPresentWait) {
++			enabledExtensions.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
++			enabledExtensions.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
++		}
+ 	}
+ 
+ 	if ( m_bSupportsModifiers )
+@@ -499,7 +540,7 @@
+ 	enabledExtensions.push_back( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
+ 	enabledExtensions.push_back( VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME );
+ 
+-	enabledExtensions.push_back( VK_EXT_ROBUSTNESS_2_EXTENSION_NAME );
++	if (m_bSupportsNullDescriptors) enabledExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+ #if 0
+ 	enabledExtensions.push_back( VK_KHR_MAINTENANCE_5_EXTENSION_NAME );
+ #endif
+@@ -543,7 +584,7 @@
+ 
+ 	VkPhysicalDeviceFeatures2 features2 = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+-		.pNext = &presentIdFeatures,
++		.pNext = m_bSupportsPresentWait ? (void *)&presentIdFeatures : (void *)&features13,
+ 		.features = {
+ 			.shaderInt16 = m_bSupportsFp16,
+ 		},
+@@ -552,7 +593,7 @@
+ 	VkDeviceCreateInfo deviceCreateInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+ 		.pNext = &features2,
+-		.queueCreateInfoCount = std::size(queueCreateInfos),
++		.queueCreateInfoCount = m_queueFamily == m_generalQueueFamily ? 1u : uint32_t(std::size(queueCreateInfos)),
+ 		.pQueueCreateInfos = queueCreateInfos,
+ 		.enabledExtensionCount = (uint32_t)enabledExtensions.size(),
+ 		.ppEnabledExtensionNames = enabledExtensions.data(),
+@@ -575,7 +616,7 @@
+ 
+ 	VkPhysicalDeviceRobustness2FeaturesEXT robustness2Features = {
+ 		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT,
+-		.pNext = std::exchange(features2.pNext, &robustness2Features),
++		.pNext = m_bSupportsNullDescriptors ? std::exchange(features2.pNext, &robustness2Features) : nullptr,
+ 		.nullDescriptor = VK_TRUE,
+ 	};
+ 
+@@ -953,6 +994,77 @@
+ 	return true;
+ }
+ 
++
++bool CVulkanDevice::createDummyResources()
++{
++    // Every descriptor gets a real image view of the shader's declared type.
++    // In particular the immutable YCbCr sampler needs a matching conversion.
++    const VkFormat formats[] = { VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM,
++                                 VK_FORMAT_R16G16B16A16_UNORM, VK_FORMAT_R16G16B16A16_UNORM };
++    const VkImageType types[] = { VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_2D, VK_IMAGE_TYPE_1D, VK_IMAGE_TYPE_3D };
++    const VkImageViewType views[] = { VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_1D, VK_IMAGE_VIEW_TYPE_3D };
++    auto command = commandBuffer();
++    if (!command) return false;
++    for (size_t i = 0; i < m_dummyImages.size(); ++i) {
++        VkImageCreateInfo image = {
++            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = types[i], .format = formats[i],
++            .extent = { 2, i == 2 ? 1u : 2u, i == 3 ? 2u : 1u },
++            .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
++            .tiling = VK_IMAGE_TILING_OPTIMAL,
++            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (i == 0 ? VK_IMAGE_USAGE_STORAGE_BIT : 0u),
++            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
++        };
++        VkResult result = vk.CreateImage(device(), &image, nullptr, &m_dummyImages[i]);
++        if (result != VK_SUCCESS) { vk_errorf(result, "dummy image creation failed"); return false; }
++        VkMemoryRequirements requirements;
++        vk.GetImageMemoryRequirements(device(), m_dummyImages[i], &requirements);
++        uint32_t memoryType = findMemoryType(VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, requirements.memoryTypeBits);
++        if (memoryType == ~0u) return false;
++        VkMemoryAllocateInfo memory = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
++            .allocationSize = requirements.size, .memoryTypeIndex = memoryType };
++        result = vk.AllocateMemory(device(), &memory, nullptr, &m_dummyMemory[i]);
++        if (result != VK_SUCCESS) return false;
++        result = vk.BindImageMemory(device(), m_dummyImages[i], m_dummyMemory[i], 0);
++        if (result != VK_SUCCESS) return false;
++        VkSamplerYcbcrConversionInfo conversion = { .sType = VK_STRUCTURE_TYPE_SAMPLER_YCBCR_CONVERSION_INFO, .conversion = m_ycbcrConversion };
++        VkImageViewCreateInfo view = { .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
++            .pNext = i == 1 ? &conversion : nullptr,
++            .image = m_dummyImages[i], .viewType = views[i], .format = formats[i],
++            .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++        result = vk.CreateImageView(device(), &view, nullptr, &m_dummyViews[i]);
++        if (result != VK_SUCCESS) return false;
++        VkImageMemoryBarrier barrier = { .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
++            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
++            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++            .image = m_dummyImages[i], .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
++        vk.CmdPipelineBarrier(command->rawBuffer(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                              0, 0, nullptr, 0, nullptr, 1, &barrier);
++        if (i == 1) {
++            // Multi-planar images cannot be cleared with CmdClearColorImage.
++            memset(m_uploadBufferData, 0, 6);
++            VkBufferImageCopy regions[2] = {
++                { .bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_PLANE_0_BIT, 0, 0, 1}, .imageExtent = {2, 2, 1} },
++                { .bufferOffset = 4, .imageSubresource = {VK_IMAGE_ASPECT_PLANE_1_BIT, 0, 0, 1}, .imageExtent = {1, 1, 1} },
++            };
++            vk.CmdCopyBufferToImage(command->rawBuffer(), m_uploadBuffer, m_dummyImages[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 2, regions);
++        } else {
++            VkClearColorValue zero = {};
++            vk.CmdClearColorImage(command->rawBuffer(), m_dummyImages[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &barrier.subresourceRange);
++        }
++        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | (i == 0 ? VK_ACCESS_SHADER_WRITE_BIT : 0u);
++        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
++        barrier.newLayout = i < 2 ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
++        vk.CmdPipelineBarrier(command->rawBuffer(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                              0, 0, nullptr, 0, nullptr, 1, &barrier);
++    }
++    submit(std::move(command));
++    waitIdle();
++    vk_log.infof("nullDescriptor unsupported: initialized real RGBA, YCbCr, 1D and 3D dummy descriptor images");
++    return true;
++}
++
+ VkSampler CVulkanDevice::sampler( SamplerState key )
+ {
+ 	if ( m_samplerCache.count(key) != 0 )
+@@ -1482,6 +1594,10 @@
+ 		imageDescriptors[i].sampler = m_device->sampler(m_samplerState[i]);
+ 		imageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+ 		ycbcrImageDescriptors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		if (!m_device->m_bSupportsNullDescriptors) {
++			imageDescriptors[i].imageView = m_device->m_dummyViews[0];
++			ycbcrImageDescriptors[i].imageView = m_device->m_dummyViews[1];
++		}
+ 		if (m_boundTextures[i] == nullptr)
+ 			continue;
+ 
+@@ -1506,13 +1622,19 @@
+ 		shaperLutDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+ 		// TODO(Josh): I hate the fact that srgbView = view *as* raw srgb and treat as linear.
+ 		// I need to change this, it's so utterly stupid and confusing.
+-		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : VK_NULL_HANDLE;
++		shaperLutDescriptor[i].imageView = m_shaperLut[i] ? m_shaperLut[i]->srgbView() : m_device->m_dummyViews[2];
+ 
+ 		lut3DDescriptor[i].sampler = m_device->sampler(nearestState);
+ 		lut3DDescriptor[i].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+-		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : VK_NULL_HANDLE;
+-	}
+-
++		lut3DDescriptor[i].imageView = m_lut3D[i] ? m_lut3D[i]->srgbView() : m_device->m_dummyViews[3];
++	}
++
++	if (!m_device->m_bSupportsNullDescriptors) {
++		for (auto &descriptor : targetDescriptors) {
++			descriptor.imageView = m_device->m_dummyViews[0];
++			descriptor.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++		}
++	}
+ 	if (!m_target->isYcbcr())
+ 	{
+ 		targetDescriptors[0].imageView = m_target->srgbView();
+@@ -2673,14 +2795,14 @@
+ 
+ 	VkPresentInfoKHR presentInfo = {
+ 		.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+-		.pNext = &presentIdInfo,
++		.pNext = g_device.supportsPresentWait() ? &presentIdInfo : nullptr,
+ 		.swapchainCount = 1,
+ 		.pSwapchains = &g_output.swapChain,
+ 		.pImageIndices = &g_output.nOutImage,
+ 	};
+ 
+ 	if ( g_device.vk.QueuePresentKHR( g_device.queue(), &presentInfo ) == VK_SUCCESS )
+-		g_currentPresentWaitId = presentId;
++		g_currentPresentWaitId = g_device.supportsPresentWait() ? presentId : 0;
+ 	else
+ 		vulkan_remake_swapchain();
+ 
+@@ -3233,7 +3355,7 @@
+ 	if (!init_nis_data())
+ 		return false;
+ 
+-	if (BIsNested() && !BIsVRSession())
++	if (BIsNested() && !BIsVRSession() && g_device.supportsPresentWait())
+ 	{
+ 		std::thread present_wait_thread( present_wait_thread_func );
+ 		present_wait_thread.detach();
+--- a/src/rendervulkan.hpp
++++ b/src/rendervulkan.hpp
+@@ -739,6 +739,7 @@
+ 	inline bool hasDrmPrimaryDevId() {return m_bHasDrmPrimaryDevId;}
+ 	inline dev_t primaryDevId() {return m_drmPrimaryDevId;}
+ 	inline bool supportsFp16() {return m_bSupportsFp16;}
++	inline bool supportsPresentWait() {return m_bSupportsPresentWait;}
+ 
+ 	inline void *uploadBufferData(uint32_t size)
+ 	{
+@@ -797,6 +798,13 @@
+ 	int m_drmRendererFd = -1;
+ 	dev_t m_drmPrimaryDevId = 0;
+ 
++	bool m_bSupportsPresentWait = false;
++	bool m_bSupportsNullDescriptors = false;
++	bool createDummyResources();
++	// Device-lifetime resources: RGBA2D/storage, YCbCr2D, LUT1D, LUT3D.
++	std::array<VkImage, 4> m_dummyImages = {};
++	std::array<VkDeviceMemory, 4> m_dummyMemory = {};
++	std::array<VkImageView, 4> m_dummyViews = {};
+ 	bool m_bSupportsFp16 = false;
+ 	bool m_bHasDrmPrimaryDevId = false;
+ 	bool m_bSupportsModifiers = false;
